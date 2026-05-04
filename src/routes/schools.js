@@ -91,5 +91,68 @@ router.post('/', auth, async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ── POST /api/schools/lookup ───────────────────────────────────────────────
+// Single or bulk GPS lookup — no auth required
+router.post('/lookup', async (req, res) => {
+  const { coordinates } = req.body;
+  if (!coordinates || !Array.isArray(coordinates)) {
+    return res.status(400).json({ error: 'coordinates array is required' });
+  }
 
+  try {
+    const results = await Promise.all(
+      coordinates.map(async (coord) => {
+        const { lat, lng, name } = coord;
+        if (!lat || !lng) return { ...coord, error: 'Invalid coordinates' };
+
+        const result = await pool.query(
+          `SELECT 
+            s.id, s.name, s.school_type, s.level, s.gender, s.district,
+            ST_Y(s.location::geometry) AS latitude,
+            ST_X(s.location::geometry) AS longitude,
+            ST_Distance(
+              ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
+              s.location
+            ) AS dist_m,
+            ST_Distance(
+              ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
+              s.location
+            ) / 1609.344 AS dist_mi
+          FROM schools s
+          WHERE s.status = 'functional'
+          ORDER BY s.location <-> ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
+          LIMIT 1`,
+          [lat, lng]
+        );
+
+        const school = result.rows[0];
+        const threshold = parseFloat(process.env.ACCESS_THRESHOLD_MILES) || 3.0;
+
+        return {
+          input_name: name || null,
+          lat: parseFloat(lat),
+          lng: parseFloat(lng),
+          nearest_school_name: school?.name || 'No school found',
+          nearest_school_type: school?.school_type || null,
+          nearest_school_district: school?.district || null,
+          nearest_school_lat: school ? parseFloat(school.latitude) : null,
+          nearest_school_lng: school ? parseFloat(school.longitude) : null,
+          dist_m: school ? parseFloat(school.dist_m).toFixed(1) : null,
+          dist_mi: school ? parseFloat(school.dist_mi).toFixed(4) : null,
+          has_school_access: school ? parseFloat(school.dist_mi) <= threshold : false,
+          verdict: school
+            ? (parseFloat(school.dist_mi) <= threshold
+                ? 'Has school access'
+                : 'NO school access — whitespace')
+            : 'No school found',
+        };
+      })
+    );
+
+    res.json({ count: results.length, threshold_miles: 3.0, results });
+  } catch (err) {
+    console.error('Lookup error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 module.exports = router;
